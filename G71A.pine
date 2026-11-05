@@ -1,0 +1,258 @@
+//@version=6
+indicator("G71A", "G71A", overlay = true, max_labels_count = 500, max_lines_count = 500)
+
+// Chart picture of the tested G71A script. Entries fill at the close.
+// The stop and targets are re-armed from the latest ATR at each close and
+// can fill on later bars. If the stop and a target are both inside one bar,
+// the drawing takes the stop.
+
+string GRP_RULE = "Rule"
+string GRP_SHOW = "Display"
+
+int atrLen = input.int(14, "ATR length", minval = 1, group = GRP_RULE)
+int smaLen = input.int(200, "Trend average", minval = 1, group = GRP_RULE)
+int slopeBars = input.int(20, "Slope lookback", minval = 1, group = GRP_RULE)
+int rsiLen = input.int(14, "RSI length", minval = 1, group = GRP_RULE)
+float rsiHigh = input.float(80.0, "RSI high", group = GRP_RULE)
+float rsiLow = input.float(20.0, "RSI low", group = GRP_RULE)
+int bbLen = input.int(20, "Bollinger length", minval = 1, group = GRP_RULE)
+float bbMult = input.float(2.0, "Bollinger mult", minval = 0.1, group = GRP_RULE)
+int squeezeLen = input.int(200, "Squeeze rank length", minval = 1, group = GRP_RULE)
+float squeezePct = input.float(10.0, "Squeeze percentile", minval = 0.0, maxval = 100.0, group = GRP_RULE)
+int rangeLen = input.int(50, "Range average", minval = 1, group = GRP_RULE)
+float rangeMult = input.float(3.0, "Range multiple", minval = 0.1, group = GRP_RULE)
+float stopMult = input.float(1.5, "Stop ATR", minval = 0.1, group = GRP_RULE)
+float partialMult = input.float(1.0, "Partial ATR", minval = 0.1, group = GRP_RULE)
+float runnerMult = input.float(4.0, "Runner ATR", minval = 0.1, group = GRP_RULE)
+
+bool showAverage = input.bool(true, "Show trend average", group = GRP_SHOW)
+string levelMode = input.string("Active trade", "Level lines", options = ["Active trade", "All trades", "Off"], group = GRP_SHOW)
+bool showLabels = input.bool(true, "Show entry and exit labels", group = GRP_SHOW)
+bool showTable = input.bool(true, "Show status table", group = GRP_SHOW)
+
+color longColor = color.new(#26a69a, 0)
+color shortColor = color.new(#ef5350, 0)
+color partialColor = color.new(#ffb74d, 0)
+color entryColor = color.new(#1565c0, 0)
+color idleColor = color.new(#787b86, 0)
+
+float atr = ta.atr(atrLen)
+float trend = ta.sma(close, smaLen)
+bool rising = trend > trend[slopeBars]
+float barRange = high - low
+float rsi = ta.rsi(close, rsiLen)
+float width = ta.bbw(close, bbLen, bbMult)
+bool squeezed = width < ta.percentile_nearest_rank(width, squeezeLen, squeezePct)
+bool wideBar = barRange > ta.sma(barRange, rangeLen) * rangeMult
+bool bullEngulf = close > open[1] and open < close[1] and close > open
+bool bearEngulf = close < open[1] and open > close[1] and close < open
+
+bool rsiLong = rsi > rsiHigh
+bool rangeLong = wideBar and close > open
+bool squeezeLong = squeezed[1] and close > high[1]
+bool rsiShort = rsi < rsiLow
+bool rangeShort = wideBar and close < open
+bool squeezeShort = squeezed[1] and close < low[1]
+
+bool longTrigger = (rsiLong or rangeLong or bullEngulf or squeezeLong) and rising and close > trend
+bool shortTrigger = (rsiShort or rangeShort or bearEngulf or squeezeShort) and not rising and close < trend
+
+triggerNames(bool rsiHit, bool rangeHit, bool engulfHit, bool squeezeHit) =>
+    string msg = ""
+    if rsiHit
+        msg := "RSI"
+    if rangeHit
+        msg := msg == "" ? "Range" : msg + " · Range"
+    if engulfHit
+        msg := msg == "" ? "Engulf" : msg + " · Engulf"
+    if squeezeHit
+        msg := msg == "" ? "Squeeze" : msg + " · Squeeze"
+    msg
+
+var int pos = 0
+var float entryPx = na
+var float workAtr = na
+var bool tookPartial = false
+var int entryBar = na
+
+int wasPos = pos
+bool wasPartial = tookPartial
+float wasEntry = entryPx
+float shownAtr = workAtr
+float armedStop = na
+float armedPartial = na
+float armedRunner = na
+if wasPos == 1 and not na(entryPx) and not na(shownAtr)
+    armedStop := entryPx - shownAtr * stopMult
+    armedPartial := entryPx + shownAtr * partialMult
+    armedRunner := entryPx + shownAtr * runnerMult
+else if wasPos == -1 and not na(entryPx) and not na(shownAtr)
+    armedStop := entryPx + shownAtr * stopMult
+    armedPartial := entryPx - shownAtr * partialMult
+    armedRunner := entryPx - shownAtr * runnerMult
+
+bool confirmed = barstate.isconfirmed
+bool exitStop = false
+bool exitPartial = false
+bool exitRunner = false
+
+if confirmed and wasPos != 0 and not na(entryBar) and bar_index > entryBar and not na(armedStop)
+    bool hitStop = wasPos == 1 ? low <= armedStop : high >= armedStop
+    bool hitPartial = wasPos == 1 ? high >= armedPartial : low <= armedPartial
+    bool hitRunner = wasPos == 1 ? high >= armedRunner : low <= armedRunner
+    if hitStop
+        exitStop := true
+        pos := 0
+        tookPartial := false
+    else if hitRunner
+        exitRunner := true
+        pos := 0
+        tookPartial := false
+    else if hitPartial and not wasPartial
+        exitPartial := true
+        tookPartial := true
+    if pos != 0 and pos == wasPos
+        workAtr := atr
+
+bool openLong = false
+bool openShort = false
+if confirmed and longTrigger and pos <= 0 and not na(atr)
+    openLong := true
+    pos := 1
+    entryPx := close
+    entryBar := bar_index
+    workAtr := atr
+    tookPartial := false
+else if confirmed and shortTrigger and pos >= 0 and not na(atr)
+    openShort := true
+    pos := -1
+    entryPx := close
+    entryBar := bar_index
+    workAtr := atr
+    tookPartial := false
+
+bool fresh = openLong or openShort
+bool closedHere = exitStop or exitRunner
+bool drawLevels = levelMode != "Off"
+
+float liveAtr = pos == 0 ? na : workAtr
+float liveStop = pos == 1 ? entryPx - liveAtr * stopMult : pos == -1 ? entryPx + liveAtr * stopMult : na
+float livePartial = pos != 0 and not tookPartial ? (pos == 1 ? entryPx + liveAtr * partialMult : entryPx - liveAtr * partialMult) : na
+float liveRunner = pos == 1 ? entryPx + liveAtr * runnerMult : pos == -1 ? entryPx - liveAtr * runnerMult : na
+
+var line lnEntry = na
+var line lnStop = na
+var line lnPartial = na
+var line lnRunner = na
+
+hold(line id, float y, int x) =>
+    if not na(id) and not na(y)
+        line.set_y1(id, y)
+        line.set_xy2(id, x, y)
+
+if drawLevels and ((closedHere and levelMode == "Active trade") or (fresh and levelMode == "Active trade"))
+    if not na(lnEntry)
+        line.delete(lnEntry)
+    if not na(lnStop)
+        line.delete(lnStop)
+    if not na(lnPartial)
+        line.delete(lnPartial)
+    if not na(lnRunner)
+        line.delete(lnRunner)
+    lnEntry := na
+    lnStop := na
+    lnPartial := na
+    lnRunner := na
+else if drawLevels and closedHere
+    hold(lnEntry, wasEntry, bar_index)
+    hold(lnStop, armedStop, bar_index)
+    hold(lnPartial, armedPartial, bar_index)
+    hold(lnRunner, armedRunner, bar_index)
+    if not na(lnEntry)
+        line.set_extend(lnEntry, extend.none)
+    if not na(lnStop)
+        line.set_extend(lnStop, extend.none)
+    if not na(lnPartial)
+        line.set_extend(lnPartial, extend.none)
+    if not na(lnRunner)
+        line.set_extend(lnRunner, extend.none)
+    lnEntry := na
+    lnStop := na
+    lnPartial := na
+    lnRunner := na
+else if drawLevels and exitPartial
+    if levelMode == "Active trade" and not na(lnPartial)
+        line.delete(lnPartial)
+    else
+        hold(lnPartial, armedPartial, bar_index)
+    lnPartial := na
+
+if drawLevels and fresh
+    float side = openLong ? 1.0 : -1.0
+    float stopPx = close - side * atr * stopMult
+    float partialPx = close + side * atr * partialMult
+    float runnerPx = close + side * atr * runnerMult
+    lnEntry := line.new(bar_index, close, bar_index, close, color = entryColor, extend = extend.right)
+    lnStop := line.new(bar_index, stopPx, bar_index, stopPx, color = shortColor, width = 2, extend = extend.right)
+    lnPartial := line.new(bar_index, partialPx, bar_index, partialPx, color = partialColor, extend = extend.right)
+    lnRunner := line.new(bar_index, runnerPx, bar_index, runnerPx, color = longColor, extend = extend.right)
+else if drawLevels and pos != 0
+    if not na(lnEntry)
+        line.set_x2(lnEntry, bar_index)
+    hold(lnStop, liveStop, bar_index)
+    hold(lnPartial, livePartial, bar_index)
+    hold(lnRunner, liveRunner, bar_index)
+
+plot(showAverage ? trend : na, "Trend average", idleColor, 1)
+plotshape(showLabels and levelMode == "Active trade" and openLong, "Long entry", shape.triangleup, location.belowbar, longColor, size = size.tiny)
+plotshape(showLabels and levelMode == "Active trade" and openShort, "Short entry", shape.triangledown, location.abovebar, shortColor, size = size.tiny)
+
+var label activeTag = na
+if showLabels and levelMode == "Active trade" and fresh
+    if not na(activeTag)
+        label.delete(activeTag)
+    activeTag := label.new(bar_index, openLong ? low : high, (openLong ? "L · " : "S · ") + triggerNames(openLong ? rsiLong : rsiShort, openLong ? rangeLong : rangeShort, openLong ? bullEngulf : bearEngulf, openLong ? squeezeLong : squeezeShort), style = openLong ? label.style_label_up : label.style_label_down, color = openLong ? color.new(#26a69a, 10) : color.new(#ef5350, 10), textcolor = color.white, size = size.small)
+if showLabels and levelMode == "Active trade" and closedHere and not fresh
+    if not na(activeTag)
+        label.delete(activeTag)
+    activeTag := na
+
+if showLabels and levelMode == "All trades" and openLong
+    label.new(bar_index, low, "L · " + triggerNames(rsiLong, rangeLong, bullEngulf, squeezeLong), style = label.style_label_up, color = color.new(#26a69a, 10), textcolor = color.white, size = size.small)
+if showLabels and levelMode == "All trades" and openShort
+    label.new(bar_index, high, "S · " + triggerNames(rsiShort, rangeShort, bearEngulf, squeezeShort), style = label.style_label_down, color = color.new(#ef5350, 10), textcolor = color.white, size = size.small)
+if showLabels and levelMode == "All trades" and exitStop
+    label.new(bar_index, armedStop, "Stop", style = label.style_label_left, color = color.new(#ef5350, 10), textcolor = color.white, size = size.tiny)
+if showLabels and levelMode == "All trades" and exitPartial
+    label.new(bar_index, armedPartial, "50%", style = label.style_label_left, color = color.new(#ffb74d, 10), textcolor = color.black, size = size.tiny)
+if showLabels and levelMode == "All trades" and exitRunner
+    label.new(bar_index, armedRunner, "4 ATR", style = label.style_label_left, color = color.new(#26a69a, 10), textcolor = color.white, size = size.tiny)
+
+string barTriggers = triggerNames(rsiLong or rsiShort, rangeLong or rangeShort, bullEngulf or bearEngulf, squeezeLong or squeezeShort)
+string regime = close > trend and rising ? "Long" : close < trend and not rising ? "Short" : "Off"
+string positionName = pos == 1 ? "Long" : pos == -1 ? "Short" : "Flat"
+string chartNote = timeframe.in_seconds() == 14400 ? "4h" : "Switch to 4h"
+
+var table hud = table.new(position.top_right, 2, 8, bgcolor = color.new(#131722, 10), border_color = color.new(#363a45, 0), border_width = 1, frame_color = color.new(#363a45, 0), frame_width = 1)
+if showTable
+    table.cell(hud, 0, 0, "Chart", text_color = color.silver, text_size = size.small)
+    table.cell(hud, 1, 0, chartNote, text_color = timeframe.in_seconds() == 14400 ? color.white : partialColor, text_size = size.small)
+    table.cell(hud, 0, 1, "Regime", text_color = color.silver, text_size = size.small)
+    table.cell(hud, 1, 1, regime, text_color = regime == "Long" ? longColor : regime == "Short" ? shortColor : color.white, text_size = size.small)
+    table.cell(hud, 0, 2, "Position", text_color = color.silver, text_size = size.small)
+    table.cell(hud, 1, 2, positionName, text_color = pos == 1 ? longColor : pos == -1 ? shortColor : color.white, text_size = size.small)
+    table.cell(hud, 0, 3, "Entry", text_color = color.silver, text_size = size.small)
+    table.cell(hud, 1, 3, pos == 0 ? "—" : str.tostring(entryPx, format.mintick), text_color = color.white, text_size = size.small)
+    table.cell(hud, 0, 4, "Stop", text_color = color.silver, text_size = size.small)
+    table.cell(hud, 1, 4, na(liveStop) ? "—" : str.tostring(liveStop, format.mintick), text_color = shortColor, text_size = size.small)
+    table.cell(hud, 0, 5, "Partial", text_color = color.silver, text_size = size.small)
+    table.cell(hud, 1, 5, pos != 0 and tookPartial ? "Filled" : na(livePartial) ? "—" : str.tostring(livePartial, format.mintick), text_color = partialColor, text_size = size.small)
+    table.cell(hud, 0, 6, "Runner", text_color = color.silver, text_size = size.small)
+    table.cell(hud, 1, 6, na(liveRunner) ? "—" : str.tostring(liveRunner, format.mintick), text_color = longColor, text_size = size.small)
+    table.cell(hud, 0, 7, "This bar", text_color = color.silver, text_size = size.small)
+    table.cell(hud, 1, 7, barTriggers == "" ? "—" : barTriggers, text_color = color.white, text_size = size.small)
+else
+    table.clear(hud, 0, 0, 1, 7)
+
+alertcondition(openLong, "G71A long", "G71A long")
+alertcondition(openShort, "G71A short", "G71A short")
